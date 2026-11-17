@@ -1,0 +1,63 @@
+name: water-pitr
+
+services:
+  # 生产源库：可写样品库，开启 WAL 持续归档
+  db:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: water
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command:
+      - postgres
+      - -c
+      - archive_mode=on
+      # 先写临时文件再原子改名，保证 API 侧看到的 WAL 段一定是完整的
+      - -c
+      - "archive_command=cp %p /wal_archive/.%f.tmp && mv /wal_archive/.%f.tmp /wal_archive/%f"
+      - -c
+      - wal_level=replica
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - wal_archive:/wal_archive
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d water"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  # 恢复 API：制作基准备份、登记核对点、把核对点恢复到独立只读实例
+  api:
+    build: ./api
+    environment:
+      SOURCE_HOST: db
+      SOURCE_PORT: "5432"
+      SOURCE_DB: water
+      SOURCE_USER: postgres
+      SOURCE_PASSWORD: postgres
+      ARCHIVE_DIR: /wal_archive
+      BACKUP_DIR: /backups
+      RECOVERY_DIR: /recoveries
+      STATE_DB: /state/api.db
+      RECOVERY_PORT: "55433"
+      RECOVERY_TIMEOUT: "180"
+    volumes:
+      - wal_archive:/wal_archive:ro   # 归档只读挂载，API 不可能改写 WAL
+      - backups:/backups
+      - recoveries:/recoveries
+      - api_state:/state
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  wal_archive:
+  backups:
+  recoveries:
+  api_state:
