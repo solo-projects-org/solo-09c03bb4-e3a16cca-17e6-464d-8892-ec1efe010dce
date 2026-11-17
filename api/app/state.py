@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at       TEXT NOT NULL,
     ready_at         TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_state (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),  -- 单行缓存
+    enabled     INTEGER NOT NULL DEFAULT 0,          -- 源库是否已启用变更记录
+    enabled_lsn TEXT,                                -- 记录起点 WAL 位点
+    enabled_at  TEXT,
+    note        TEXT,
+    updated_at  TEXT
+);
 """
 
 # 进行中（未终结）的任务状态：一次只允许一个
@@ -108,3 +116,21 @@ def update_job(job_id: int, **fields) -> None:
     fields["updated_at"] = now()
     cols = ", ".join(f"{k}=?" for k in fields)
     execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
+
+
+# ---------------------------------------------------------------- 变更记录状态缓存
+
+def get_audit_state() -> dict | None:
+    return one_row("SELECT * FROM audit_state WHERE id=1")
+
+
+def set_audit_state(enabled: bool, enabled_lsn: str | None = None,
+                    enabled_at: str | None = None, note: str | None = None) -> None:
+    execute(
+        "INSERT INTO audit_state (id, enabled, enabled_lsn, enabled_at, note, updated_at)"
+        " VALUES (1,?,?,?,?,?)"
+        " ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,"
+        "   enabled_lsn=excluded.enabled_lsn, enabled_at=excluded.enabled_at,"
+        "   note=excluded.note, updated_at=excluded.updated_at",
+        (1 if enabled else 0, enabled_lsn, enabled_at, note, now()),
+    )

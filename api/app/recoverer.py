@@ -24,6 +24,10 @@ class Cancelled(Exception):
     """任务被用户取消。"""
 
 
+class InstanceSwitched(RuntimeError):
+    """恢复实例已被切换：当前监听的实例不属于本任务，查询结果不得算作本任务的。"""
+
+
 # ---------------------------------------------------------------- 调度
 
 def dispatch_loop(stop: threading.Event) -> None:
@@ -368,8 +372,24 @@ def _query_conn() -> psycopg.Connection:
     )
 
 
-def fetch_samples(station_no: str | None, sample_no: str | None,
-                  limit: int) -> list[dict]:
+def _verify_instance(con, expected_data_dir: str) -> None:
+    """在同一连接上核验当前恢复实例的身份（数据目录）。
+
+    一次只恢复一项：新任务就绪会取代旧实例。若查询打到被取代任务上，
+    端口后监听的可能是另一核对点的实例——必须在同一连接上确认数据目录，
+    否则会把另一核对点的结果错标成本任务的。
+    """
+    row = con.execute("SHOW data_directory").fetchone()
+    actual = row["data_directory"] if isinstance(row, dict) else row[0]
+    if os.path.realpath(actual) != os.path.realpath(expected_data_dir):
+        raise InstanceSwitched(
+            f"恢复实例已切换：当前实例数据目录为 {actual}，"
+            f"与本任务的 {expected_data_dir} 不符；请改用最新 ready 任务查询"
+        )
+
+
+def fetch_samples(expected_data_dir: str, station_no: str | None,
+                  sample_no: str | None, limit: int) -> list[dict]:
     sql = ("SELECT id, sample_no, station_no, ph::float8 AS ph, created_at"
            " FROM public.samples")
     where, params = [], []
@@ -384,13 +404,91 @@ def fetch_samples(station_no: str | None, sample_no: str | None,
     sql += " ORDER BY id LIMIT %s"
     params.append(limit)
     with _query_conn() as con:
+        _verify_instance(con, expected_data_dir)
         return con.execute(sql, params).fetchall()
+
+
+def fetch_lineage(expected_data_dir: str, sample_no: str) -> dict:
+    """在恢复实例上查询某样品号的变更沿革（按行身份分代）。
+
+    同一连接先核验实例身份，再读取事件与样品当前行：恢复实例只读且冻结在
+    核对点时点，二者必然处于同一时点。事件与样品都只来自该核对点实例。
+    """
+    with _query_conn() as con:
+        _verify_instance(con, expected_data_dir)
+        events_table = con.execute(
+            "SELECT to_regclass('public.sample_events') AS t"
+        ).fetchone()["t"]
+        if not events_table:
+            return {
+                "lineage_available": False,
+                "reason": "该核对点早于变更记录启用时点：恢复实例中不存在样品变更事件表"
+                          "（sample_events），此核对点的变更沿革不可用",
+                "recording_start": None,
+                "current_row": None,
+                "incarnations": [],
+                "incarnation_count": 0,
+                "event_count": 0,
+            }
+        meta = con.execute(
+            "SELECT enabled_at, enabled_lsn, note FROM public.audit_meta WHERE id"
+        ).fetchone()
+        events = con.execute(
+            "SELECT id, row_uid::text AS row_uid, op,"
+            "       old_station_no, old_ph::float8 AS old_ph,"
+            "       new_station_no, new_ph::float8 AS new_ph,"
+            "       txid, changed_at"
+            "  FROM public.sample_events WHERE sample_no = %s ORDER BY id",
+            (sample_no,),
+        ).fetchall()
+        current = con.execute(
+            "SELECT row_uid::text AS row_uid, station_no, ph::float8 AS ph, created_at"
+            "  FROM public.samples WHERE sample_no = %s",
+            (sample_no,),
+        ).fetchone()
+
+    # 按行身份（row_uid）分代：同号重录的新行是新一代，不接旧行的沿革
+    incarnations: list[dict] = []
+    by_uid: dict[str, dict] = {}
+    for e in events:
+        inc = by_uid.get(e["row_uid"])
+        if inc is None:
+            inc = {"row_uid": e["row_uid"], "is_current": False,
+                   "ended_by": None, "events": []}
+            by_uid[e["row_uid"]] = inc
+            incarnations.append(inc)
+        inc["events"].append({
+            "seq": e["id"], "op": e["op"],
+            "old_station_no": e["old_station_no"], "old_ph": e["old_ph"],
+            "new_station_no": e["new_station_no"], "new_ph": e["new_ph"],
+            "txid": e["txid"], "changed_at": e["changed_at"],
+        })
+    current_uid = current["row_uid"] if current else None
+    for inc in incarnations:
+        last_op = inc["events"][-1]["op"]
+        inc["ended_by"] = "DELETE" if last_op == "DELETE" else None
+        inc["is_current"] = bool(current_uid) and inc["row_uid"] == current_uid
+    if current_uid and current_uid not in by_uid:
+        # 当前行在记录起点前已存在且启用后未变更：无任何事件，如实呈现
+        incarnations.append({"row_uid": current_uid, "is_current": True,
+                             "ended_by": None, "events": []})
+    return {
+        "lineage_available": True,
+        "reason": None,
+        "recording_start": meta,  # 记录起点（随 PITR 恢复，与该实例同时点）
+        "current_row": current,
+        "incarnations": incarnations,
+        "incarnation_count": len(incarnations),
+        "event_count": len(events),
+        "note": "事件与样品当前行读取自同一恢复实例（同一时点）；"
+                "同号重录的新行有独立行身份 row_uid，沿革按行身份分代，不接续旧行",
+    }
 
 
 _ALLOWED_HEADS = ("select", "with", "values", "table")
 
 
-def run_adhoc_query(sql: str, max_rows: int = 500) -> list[dict]:
+def run_adhoc_query(expected_data_dir: str, sql: str, max_rows: int = 500) -> list[dict]:
     """受护栏约束的只读查询（演示用）。
 
     真正的兜底是连接上的 default_transaction_read_only=on：
@@ -403,5 +501,6 @@ def run_adhoc_query(sql: str, max_rows: int = 500) -> list[dict]:
     if head not in _ALLOWED_HEADS:
         raise ValueError("只允许 SELECT/WITH/VALUES/TABLE 开头的只读语句")
     with _query_conn() as con:
+        _verify_instance(con, expected_data_dir)
         cur = con.execute(sql)
         return cur.fetchmany(max_rows)
